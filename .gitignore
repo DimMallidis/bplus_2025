@@ -1,0 +1,16 @@
+# Build artifacts
+/build/
+bp_main
+*.o
+*.obj
+*.exe
+*.dll
+
+# Editor/OS files
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Ignore local secrets or log files
+*.log
