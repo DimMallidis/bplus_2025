@@ -1,232 +1,310 @@
 #include "bplus_file_funcs.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#define CALL_BF(call)         \
-  {                           \
+#define BPLUS_MAGIC 0xBEEFBEEF
+
+typedef struct {
+  int magic_number;
+  int root_block_id;
+  int height;
+  int total_blocks;
+  TableSchema schema;
+} BPlusMetaImpl;
+
+// macro to check bf errors
+#define CALL_BF(call) do { \
     BF_ErrorCode code = call; \
-    if (code != BF_OK)        \
-    {                         \
-      BF_PrintError(code);    \
-      return -1;              \
-    }                         \
-  }
+    if (code != BF_OK) { \
+        BF_PrintError(code); \
+        return -1; \
+    } \
+} while (0)
 
+int bplus_create_file(const TableSchema *schema, const char *fileName) {
+    CALL_BF(BF_CreateFile(fileName));
+    int fd;
+    CALL_BF(BF_OpenFile(fileName, &fd));
 
-int bplus_create_file(const TableSchema *schema, const char *fileName)
-{
-  // Schema not persisted; leaf records store raw Record
-  (void)schema;
+    BF_Block *b0;
+    BF_Block_Init(&b0);
+    BF_Block *b1;
+    BF_Block_Init(&b1);
 
-  // Create file and open
-  CALL_BF(BF_CreateFile(fileName));
+    // allocate block 0 and 1
+    if (BF_AllocateBlock(fd, b0) != BF_OK) { 
+        BF_Block_Destroy(&b0); 
+        BF_Block_Destroy(&b1); 
+        return -1; 
+    }
+    
+    if (BF_AllocateBlock(fd, b1) != BF_OK) { 
+        BF_Block_Destroy(&b0); 
+        BF_Block_Destroy(&b1); 
+        return -1; 
+    }
 
-  int fd;
-  CALL_BF(BF_OpenFile(fileName, &fd));
+    BPlusMetaImpl meta;
+    meta.magic_number = BPLUS_MAGIC;
+    meta.root_block_id = 1;
+    meta.height = 1;
+    meta.schema = *schema;
+    
+    int blocks;
+    // get total blocks
+    if (BF_GetBlockCounter(fd, &blocks) != BF_OK) { 
+        BF_Block_Destroy(&b0); 
+        BF_Block_Destroy(&b1); 
+        return -1; 
+    }
+    meta.total_blocks = blocks;
 
-  // Allocate block 0 (metadata) and block 1 (root leaf)
-  BF_Block *b0; BF_Block_Init(&b0);
-  BF_Block *b1; BF_Block_Init(&b1);
+    memcpy(BF_Block_GetData(b0), &meta, sizeof(BPlusMetaImpl));
+    BF_Block_SetDirty(b0);
 
-  CALL_BF(BF_AllocateBlock(fd, b0));
-  CALL_BF(BF_AllocateBlock(fd, b1));
+    // init root as empty leaf
+    DataNode leaf;
+    datanode_init(&leaf);
+    memcpy(BF_Block_GetData(b1), &leaf, sizeof(DataNode));
+    BF_Block_SetDirty(b1);
 
-  // Initialize metadata
-  BPlusMeta meta;
-  meta.magic_number = 0xBEEFBEEF;
-  meta.root_block_id = 1; // root is a leaf at block 1
-  meta.height = 1;        // height 1 => single leaf root
-  int blocks_num;
-  CALL_BF(BF_GetBlockCounter(fd, &blocks_num));
-  meta.total_blocks = blocks_num;
-
-  char *d0 = BF_Block_GetData(b0);
-  memcpy(d0, &meta, sizeof(BPlusMeta));
-  BF_Block_SetDirty(b0);
-
-  // Initialize empty leaf
-  DataNode leaf;
-  leaf.count = 0;
-  leaf.next_block_id = -1;
-  char *d1 = BF_Block_GetData(b1);
-  memcpy(d1, &leaf, sizeof(DataNode));
-  BF_Block_SetDirty(b1);
-
-  // Unpin & destroy blocks
-  CALL_BF(BF_UnpinBlock(b0));
-  CALL_BF(BF_UnpinBlock(b1));
-  BF_Block_Destroy(&b0);
-  BF_Block_Destroy(&b1);
-
-  // Close file
-  CALL_BF(BF_CloseFile(fd));
-  return 0;
+    BF_UnpinBlock(b0); BF_Block_Destroy(&b0);
+    BF_UnpinBlock(b1); BF_Block_Destroy(&b1);
+    CALL_BF(BF_CloseFile(fd));
+    return 0;
 }
 
+int bplus_open_file(const char *fileName, int *file_desc, BPlusMeta **metadata) {
+    CALL_BF(BF_OpenFile(fileName, file_desc));
+    BF_Block *b0;
+    BF_Block_Init(&b0);
+    
+    // get metadata block
+    if (BF_GetBlock(*file_desc, 0, b0) != BF_OK) {
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);
+        return -1;
+    }
 
-int bplus_open_file(const char *fileName, int *file_desc, BPlusMeta **metadata)
-{
-  // Open the BF file
-  CALL_BF(BF_OpenFile(fileName, file_desc));
+    *metadata = (BPlusMeta*)malloc(sizeof(BPlusMetaImpl));
+    if (*metadata == NULL) {
+        BF_UnpinBlock(b0);
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);
+        return -1;
+    }
+    memcpy(*metadata, BF_Block_GetData(b0), sizeof(BPlusMetaImpl));
 
-  // Read metadata from block 0
-  BF_Block *b; BF_Block_Init(&b);
-  CALL_BF(BF_GetBlock(*file_desc, 0, b));
-  char *data = BF_Block_GetData(b);
+    // check magic number is correct
+    if (((BPlusMetaImpl*)(*metadata))->magic_number != BPLUS_MAGIC) {
+        free(*metadata);
+        *metadata = NULL;
+        BF_UnpinBlock(b0);
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);
+        return -1;
+    }
 
-  *metadata = (BPlusMeta*)malloc(sizeof(BPlusMeta));
-  if (*metadata == NULL) {
+    BF_UnpinBlock(b0);
+    BF_Block_Destroy(&b0);
+    return 0;
+}
+
+int bplus_close_file(int file_desc, BPlusMeta* metadata) {
+    if (metadata) {
+        BF_Block *b0;
+        BF_Block_Init(&b0);
+        // save metadata back
+        if (BF_GetBlock(file_desc, 0, b0) != BF_OK) { BF_Block_Destroy(&b0); return -1; }
+        memcpy(BF_Block_GetData(b0), metadata, sizeof(BPlusMetaImpl));
+        BF_Block_SetDirty(b0);
+        BF_UnpinBlock(b0);
+        BF_Block_Destroy(&b0);
+        free(metadata);
+    }
+    CALL_BF(BF_CloseFile(file_desc));
+    return 0;
+}
+
+int bplus_record_find(int file_desc, const BPlusMeta *metadata, int key, Record** out_record) {
+    const BPlusMetaImpl *meta = (const BPlusMetaImpl*)metadata;
+    // init to null just in case
+    if (out_record) {
+        *out_record = NULL;
+    }
+
+    int curr = meta->root_block_id;
+    int height = meta->height;
+
+    // go thru index nodes
+    for (int h = 1; h < height; h++) {
+        BF_Block *b;
+        BF_Block_Init(&b);
+        if (BF_GetBlock(file_desc, curr, b) != BF_OK) { BF_Block_Destroy(&b); return -1; }
+        IndexNode *idx = (IndexNode*)BF_Block_GetData(b);
+
+        // find child
+        curr = indexnode_get_child(idx, key);
+        BF_UnpinBlock(b);
+        BF_Block_Destroy(&b);
+    }
+
+    // search in leaf
+    BF_Block *bl;
+    BF_Block_Init(&bl);
+    if (BF_GetBlock(file_desc, curr, bl) != BF_OK) { BF_Block_Destroy(&bl); return -1; }
+    DataNode *leaf = (DataNode*)BF_Block_GetData(bl);
+
+    int found_idx = datanode_find_key(leaf, &meta->schema, key);
+    if (found_idx >= 0) {
+        // found it, copy it out
+        if (out_record) {
+            *out_record = malloc(sizeof(Record));
+            if (*out_record) {
+                **out_record = leaf->records[found_idx];
+            }
+        }
+        BF_UnpinBlock(bl);
+        BF_Block_Destroy(&bl);
+        return 0;
+    }
+
+    BF_UnpinBlock(bl);
+    BF_Block_Destroy(&bl);
+    return -1;
+}
+
+static int insert_recursive(int file_desc, BPlusMetaImpl *metadata, int curr_block, const Record *record, int *up_key, int *up_right, int height) {
+    BF_Block *b;
+    BF_Block_Init(&b);
+    if (BF_GetBlock(file_desc, curr_block, b) != BF_OK) { BF_Block_Destroy(&b); return -1; }
+
+    int ret_val = -1;
+
+    if (height == 1) { // leaf node
+        DataNode *leaf = (DataNode*)BF_Block_GetData(b);
+        int key = record_get_key(&metadata->schema, record);
+        
+        int pos = datanode_find_insert_pos(leaf, &metadata->schema, key);
+
+        if (!datanode_is_full(leaf)) {
+            // just insert, no split
+            datanode_insert_at(leaf, pos, record);
+            BF_Block_SetDirty(b);
+            *up_right = -1; 
+            ret_val = curr_block;
+        } else {
+            // split leaf
+            BF_Block *new_b;
+            BF_Block_Init(&new_b);
+            if (BF_AllocateBlock(file_desc, new_b) != BF_OK) {
+                BF_UnpinBlock(b); BF_Block_Destroy(&b); BF_Block_Destroy(&new_b); return -1;
+            }
+            int new_id;
+            BF_GetBlockCounter(file_desc, &new_id); new_id--;
+            metadata->total_blocks = new_id + 1;
+            
+            DataNode *new_leaf = (DataNode*)BF_Block_GetData(new_b);
+            datanode_init(new_leaf);
+
+            int split = (MAX_RECORDS_LEAF + 1) / 2;
+            *up_key = datanode_split(leaf, new_leaf, record, &metadata->schema, pos, new_id);
+            *up_right = new_id;
+
+            if (pos < split) ret_val = curr_block;
+            else ret_val = new_id;
+
+            BF_Block_SetDirty(b);
+            BF_Block_SetDirty(new_b);
+            BF_UnpinBlock(new_b); BF_Block_Destroy(&new_b);
+        }
+    } else { // index node
+        IndexNode *idx = (IndexNode*)BF_Block_GetData(b);
+        int key = record_get_key(&metadata->schema, record);
+        
+        int pos = indexnode_find_child_index(idx, key);
+        int child = idx->children[pos];
+
+        int child_up_key, child_up_right;
+        ret_val = insert_recursive(file_desc, metadata, child, record, &child_up_key, &child_up_right, height - 1);
+
+        if (child_up_right != -1) {
+            // child split, insert here
+            if (!indexnode_is_full(idx)) {
+                indexnode_insert_at(idx, pos, child_up_key, child_up_right);
+                BF_Block_SetDirty(b);
+                *up_right = -1;
+            } else {
+                // split index node
+                BF_Block *new_b;
+                BF_Block_Init(&new_b);
+                if (BF_AllocateBlock(file_desc, new_b) != BF_OK) {
+                    BF_UnpinBlock(b); BF_Block_Destroy(&b); BF_Block_Destroy(&new_b); return -1;
+                }
+                int new_id;
+                BF_GetBlockCounter(file_desc, &new_id); new_id--;
+                metadata->total_blocks = new_id + 1;
+                
+                IndexNode *new_idx = (IndexNode*)BF_Block_GetData(new_b);
+                indexnode_init(new_idx);
+
+                indexnode_split(idx, new_idx, child_up_key, child_up_right, pos, up_key);
+                *up_right = new_id;
+
+                BF_Block_SetDirty(b);
+                BF_Block_SetDirty(new_b);
+                BF_UnpinBlock(new_b); BF_Block_Destroy(&new_b);
+            }
+        } else {
+             *up_right = -1;
+        }
+    }
+
     BF_UnpinBlock(b);
     BF_Block_Destroy(&b);
-    return -1;
-  }
-  memcpy(*metadata, data, sizeof(BPlusMeta));
-
-  CALL_BF(BF_UnpinBlock(b));
-  BF_Block_Destroy(&b);
-  return 0;
+    return ret_val;
 }
 
-int bplus_close_file(const int file_desc, BPlusMeta* metadata)
-{
-  if (metadata != NULL) {
-    // Persist metadata to block 0 before closing
-    BF_Block *b; BF_Block_Init(&b);
-    CALL_BF(BF_GetBlock(file_desc, 0, b));
-    char *data = BF_Block_GetData(b);
-    memcpy(data, metadata, sizeof(BPlusMeta));
-    BF_Block_SetDirty(b);
-    CALL_BF(BF_UnpinBlock(b));
-    BF_Block_Destroy(&b);
-    free(metadata);
-  }
-  CALL_BF(BF_CloseFile(file_desc));
-  return 0;
-}
+int bplus_record_insert(int file_desc, BPlusMeta* metadata, const Record *record) {
+    BPlusMetaImpl *meta = (BPlusMetaImpl*)metadata;
+    int up_key, up_right;
+    int ret = insert_recursive(file_desc, meta, meta->root_block_id, record, &up_key, &up_right, meta->height);
 
-int bplus_record_insert(const int file_desc, BPlusMeta *metadata, const Record *record)
-{
-  // Traverse from root to leaf
-  int current = metadata->root_block_id;
-  for (int level = metadata->height; level > 1; --level) {
-    BF_Block *b; BF_Block_Init(&b);
-    CALL_BF(BF_GetBlock(file_desc, current, b));
-    IndexNode idx;
-    memcpy(&idx, BF_Block_GetData(b), sizeof(IndexNode));
-    int key = record->values[0].int_value;
-    int i = 0; while (i < idx.count && key >= idx.keys[i]) i++;
-    current = idx.children[i];
-    CALL_BF(BF_UnpinBlock(b));
-    BF_Block_Destroy(&b);
-  }
+    if (up_right != -1) {
+        // root split, make new root
+        BF_Block *new_root_b;
+        BF_Block_Init(&new_root_b);
+        
+        if (BF_AllocateBlock(file_desc, new_root_b) != BF_OK) { 
+            BF_Block_Destroy(&new_root_b); 
+            return -1; 
+        }
+        
+        int new_root_id;
+        BF_GetBlockCounter(file_desc, &new_root_id); new_root_id--;
+        meta->total_blocks = new_root_id + 1;
 
-  // Load leaf
-  BF_Block *bl; BF_Block_Init(&bl);
-  CALL_BF(BF_GetBlock(file_desc, current, bl));
-  DataNode leaf; memcpy(&leaf, BF_Block_GetData(bl), sizeof(DataNode));
+        IndexNode *root = (IndexNode*)BF_Block_GetData(new_root_b);
+        indexnode_init(root);
+        root->count = 1;
+        root->keys[0] = up_key;
+        root->children[0] = meta->root_block_id;
+        root->children[1] = up_right;
 
-  // Insert in sorted order
-  int key = record->values[0].int_value;
-  int pos = leaf.count;
-  while (pos > 0) {
-    int kprev = leaf.records[pos-1].values[0].int_value;
-    if (kprev > key) { leaf.records[pos] = leaf.records[pos-1]; pos--; } else break;
-  }
-  leaf.records[pos] = *record;
-  leaf.count++;
+        BF_Block_SetDirty(new_root_b);
+        BF_UnpinBlock(new_root_b); BF_Block_Destroy(&new_root_b);
 
-  if (leaf.count <= MAX_RECORDS_LEAF) {
-    // Write back and finish
-    char *d = BF_Block_GetData(bl);
-    memcpy(d, &leaf, sizeof(DataNode));
-    BF_Block_SetDirty(bl);
-    CALL_BF(BF_UnpinBlock(bl)); BF_Block_Destroy(&bl);
-    return current;
-  }
+        meta->root_block_id = new_root_id;
+        meta->height++;
 
-  // Split leaf when overflow
-  DataNode right; memset(&right, 0, sizeof(DataNode));
-  right.next_block_id = leaf.next_block_id;
-  int left_count = (MAX_RECORDS_LEAF + 1) / 2; // ceil split for 6th insert -> 3
-  int right_count = leaf.count - left_count;
-  right.count = right_count;
-  for (int i = 0; i < right_count; ++i) {
-    right.records[i] = leaf.records[left_count + i];
-  }
-  leaf.count = left_count;
-
-  // Allocate new block for right leaf
-  BF_Block *br; BF_Block_Init(&br);
-  CALL_BF(BF_AllocateBlock(file_desc, br));
-  int blocks_num; CALL_BF(BF_GetBlockCounter(file_desc, &blocks_num));
-  int right_id = blocks_num - 1;
-  leaf.next_block_id = right_id;
-
-  // Write updated left and new right
-  char *dl = BF_Block_GetData(bl); memcpy(dl, &leaf, sizeof(DataNode)); BF_Block_SetDirty(bl);
-  char *dr = BF_Block_GetData(br); memcpy(dr, &right, sizeof(DataNode)); BF_Block_SetDirty(br);
-  CALL_BF(BF_UnpinBlock(bl)); BF_Block_Destroy(&bl);
-  CALL_BF(BF_UnpinBlock(br)); BF_Block_Destroy(&br);
-
-  // Promote smallest key of right to parent
-  int promote_key = right.records[0].values[0].int_value;
-
-  if (metadata->height == 1) {
-    // Create new root index node
-    BF_Block *bi; BF_Block_Init(&bi);
-    CALL_BF(BF_AllocateBlock(file_desc, bi));
-    int blocks_num2; CALL_BF(BF_GetBlockCounter(file_desc, &blocks_num2));
-    int new_root = blocks_num2 - 1;
-
-    IndexNode root; memset(&root, 0, sizeof(IndexNode));
-    root.count = 1; root.keys[0] = promote_key; root.children[0] = current; root.children[1] = right_id;
-    char *di = BF_Block_GetData(bi); memcpy(di, &root, sizeof(IndexNode)); BF_Block_SetDirty(bi);
-    CALL_BF(BF_UnpinBlock(bi)); BF_Block_Destroy(&bi);
-
-    metadata->root_block_id = new_root; metadata->height = 2;
-    CALL_BF(BF_GetBlockCounter(file_desc, &metadata->total_blocks));
-    // persist metadata
-    BF_Block *bm; BF_Block_Init(&bm);
-    CALL_BF(BF_GetBlock(file_desc, 0, bm));
-    char *dm = BF_Block_GetData(bm); memcpy(dm, metadata, sizeof(BPlusMeta)); BF_Block_SetDirty(bm);
-    CALL_BF(BF_UnpinBlock(bm)); BF_Block_Destroy(&bm);
-    return right_id;
-  }
-
-  // For height > 1, minimal parent update is not yet implemented
-  // Return right_id to signal split occurred
-  return right_id;
-}
-
-int bplus_record_find(const int file_desc, const BPlusMeta *metadata, const int key, Record** out_record)
-{  
-  int current = metadata->root_block_id;
-  // Traverse down to leaf
-  for (int level = metadata->height; level > 1; --level) {
-    BF_Block *b; BF_Block_Init(&b);
-    CALL_BF(BF_GetBlock(file_desc, current, b));
-    IndexNode idx; memcpy(&idx, BF_Block_GetData(b), sizeof(IndexNode));
-    int i = 0; while (i < idx.count && key >= idx.keys[i]) i++;
-    current = idx.children[i];
-    CALL_BF(BF_UnpinBlock(b)); BF_Block_Destroy(&b);
-  }
-
-  // Search within leaf
-  BF_Block *bl; BF_Block_Init(&bl);
-  CALL_BF(BF_GetBlock(file_desc, current, bl));
-  DataNode leaf; memcpy(&leaf, BF_Block_GetData(bl), sizeof(DataNode));
-  for (int i = 0; i < leaf.count; ++i) {
-    int k = leaf.records[i].values[0].int_value;
-    if (k == key) {
-      // Copy out to caller-provided pointer
-      if (*out_record != NULL) {
-        **out_record = leaf.records[i];
-      }
-      CALL_BF(BF_UnpinBlock(bl)); BF_Block_Destroy(&bl);
-      return 0;
+        // update metadata
+        BF_Block *meta_b;
+        BF_Block_Init(&meta_b);
+        if (BF_GetBlock(file_desc, 0, meta_b) != BF_OK) { BF_Block_Destroy(&meta_b); return -1; }
+        memcpy(BF_Block_GetData(meta_b), meta, sizeof(BPlusMetaImpl));
+        BF_Block_SetDirty(meta_b);
+        BF_UnpinBlock(meta_b); BF_Block_Destroy(&meta_b);
     }
-  }
-  CALL_BF(BF_UnpinBlock(bl)); BF_Block_Destroy(&bl);
-  *out_record = NULL;
-  return -1;
+    return ret;
 }
-
