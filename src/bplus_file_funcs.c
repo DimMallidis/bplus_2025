@@ -38,9 +38,9 @@ int bplus_create_file(const TableSchema *schema, const char *fileName) {
     memcpy(BF_Block_GetData(b0), &meta, sizeof(BPlusMeta));
     BF_Block_SetDirty(b0);
 
+    /* Initialize root as empty leaf node using helper */
     DataNode leaf;
-    leaf.count = 0;
-    leaf.next_block_id = -1;
+    datanode_init(&leaf);
     memcpy(BF_Block_GetData(b1), &leaf, sizeof(DataNode));
     BF_Block_SetDirty(b1);
 
@@ -54,10 +54,30 @@ int bplus_open_file(const char *fileName, int *file_desc, BPlusMeta **metadata) 
     CALL_BF(BF_OpenFile(fileName, file_desc));
     BF_Block *b0;
     BF_Block_Init(&b0);
-    if (BF_GetBlock(*file_desc, 0, b0) != BF_OK) { BF_Block_Destroy(&b0); return -1; }
+    if (BF_GetBlock(*file_desc, 0, b0) != BF_OK) {
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);  /* Fix: close file on error */
+        return -1;
+    }
 
     *metadata = malloc(sizeof(BPlusMeta));
+    if (*metadata == NULL) {
+        BF_UnpinBlock(b0);
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);  /* Fix: close file on malloc failure */
+        return -1;
+    }
     memcpy(*metadata, BF_Block_GetData(b0), sizeof(BPlusMeta));
+
+    /* Fix: Validate magic number */
+    if ((*metadata)->magic_number != BPLUS_MAGIC) {
+        free(*metadata);
+        *metadata = NULL;
+        BF_UnpinBlock(b0);
+        BF_Block_Destroy(&b0);
+        BF_CloseFile(*file_desc);
+        return -1;  /* Not a valid B+ tree file */
+    }
 
     BF_UnpinBlock(b0);
     BF_Block_Destroy(&b0);
@@ -80,24 +100,23 @@ int bplus_close_file(int file_desc, BPlusMeta* metadata) {
 }
 
 int bplus_record_find(int file_desc, const BPlusMeta *metadata, int key, Record** out_record) {
+    /* Fix: Initialize out_record to NULL for not-found case */
+    if (out_record) {
+        *out_record = NULL;
+    }
+
     int curr = metadata->root_block_id;
     int height = metadata->height;
 
-    /* traverse index nodes */
+    /* traverse index nodes using helper function */
     for (int h = 1; h < height; h++) {
         BF_Block *b;
         BF_Block_Init(&b);
         if (BF_GetBlock(file_desc, curr, b) != BF_OK) { BF_Block_Destroy(&b); return -1; }
         IndexNode *idx = (IndexNode*)BF_Block_GetData(b);
 
-        int next_blk = idx->children[idx->count]; /* default to last child */
-        for (int i = 0; i < idx->count; i++) {
-            if (key < idx->keys[i]) {
-                next_blk = idx->children[i];
-                break;
-            }
-        }
-        curr = next_blk;
+        /* Use helper to find the correct child */
+        curr = indexnode_get_child(idx, key);
         BF_UnpinBlock(b);
         BF_Block_Destroy(&b);
     }
@@ -108,23 +127,27 @@ int bplus_record_find(int file_desc, const BPlusMeta *metadata, int key, Record*
     if (BF_GetBlock(file_desc, curr, bl) != BF_OK) { BF_Block_Destroy(&bl); return -1; }
     DataNode *leaf = (DataNode*)BF_Block_GetData(bl);
 
-    for (int i = 0; i < leaf->count; i++) {
-        if (record_get_key(&metadata->schema, &leaf->records[i]) == key) {
-            if (out_record && *out_record) {
-                **out_record = leaf->records[i];
+    /* Use helper to search for key in leaf */
+    int found_idx = datanode_find_key(leaf, &metadata->schema, key);
+    if (found_idx >= 0) {
+        /* Fix: Allocate and copy record when found */
+        if (out_record) {
+            *out_record = malloc(sizeof(Record));
+            if (*out_record) {
+                **out_record = leaf->records[found_idx];
             }
-            BF_UnpinBlock(bl);
-            BF_Block_Destroy(&bl);
-            return 0; /* found */
         }
+        BF_UnpinBlock(bl);
+        BF_Block_Destroy(&bl);
+        return 0; /* found */
     }
 
     BF_UnpinBlock(bl);
     BF_Block_Destroy(&bl);
-    return -1;
+    return -1; /* not found, out_record is already NULL */
 }
 
-static int insert_recursive(int file_desc, int curr_block, const Record *record, int *up_key, int *up_right, int height, const TableSchema *schema) {
+static int insert_recursive(int file_desc, BPlusMeta *metadata, int curr_block, const Record *record, int *up_key, int *up_right, int height) {
     BF_Block *b;
     BF_Block_Init(&b);
     if (BF_GetBlock(file_desc, curr_block, b) != BF_OK) { BF_Block_Destroy(&b); return -1; }
@@ -133,16 +156,14 @@ static int insert_recursive(int file_desc, int curr_block, const Record *record,
 
     if (height == 1) { /* leaf node */
         DataNode *leaf = (DataNode*)BF_Block_GetData(b);
-        /* insert sorted */
-        int key = record_get_key(schema, record);
-        int pos = 0;
-        while (pos < leaf->count && record_get_key(schema, &leaf->records[pos]) < key) pos++;
+        int key = record_get_key(&metadata->schema, record);
+        
+        /* Use helper to find insert position */
+        int pos = datanode_find_insert_pos(leaf, &metadata->schema, key);
 
-        if (leaf->count < MAX_RECORDS_LEAF) {
-            /* shift */
-            for (int i = leaf->count; i > pos; i--) leaf->records[i] = leaf->records[i-1];
-            leaf->records[pos] = *record;
-            leaf->count++;
+        if (!datanode_is_full(leaf)) {
+            /* Use helper to insert record */
+            datanode_insert_at(leaf, pos, record);
             BF_Block_SetDirty(b);
             *up_right = -1; /* no split */
             ret_val = curr_block;
@@ -155,32 +176,16 @@ static int insert_recursive(int file_desc, int curr_block, const Record *record,
             }
             int new_id;
             BF_GetBlockCounter(file_desc, &new_id); new_id--;
+            metadata->total_blocks = new_id + 1;  /* Fix: update total_blocks */
             DataNode *new_leaf = (DataNode*)BF_Block_GetData(new_b);
+            datanode_init(new_leaf);
 
-            /* distribute */
-            Record temp[MAX_RECORDS_LEAF + 1];
-            int j=0;
-            for(int i=0; i<leaf->count; i++) {
-                if(i == pos) temp[j++] = *record;
-                temp[j++] = leaf->records[i];
-            }
-            if(pos == leaf->count) temp[j++] = *record;
-
+            /* Use helper to split the leaf node */
             int split = (MAX_RECORDS_LEAF + 1) / 2;
-
-            leaf->count = split;
-            for(int i=0; i<split; i++) leaf->records[i] = temp[i];
-
-            new_leaf->count = (MAX_RECORDS_LEAF + 1) - split;
-            for(int i=0; i<new_leaf->count; i++) new_leaf->records[i] = temp[split+i];
-
-            new_leaf->next_block_id = leaf->next_block_id;
-            leaf->next_block_id = new_id;
-
-            *up_key = record_get_key(schema, &new_leaf->records[0]);
+            *up_key = datanode_split(leaf, new_leaf, record, &metadata->schema, pos, new_id);
             *up_right = new_id;
 
-            /* fix: return id where record landed */
+            /* Return id where record landed */
             if (pos < split) ret_val = curr_block;
             else ret_val = new_id;
 
@@ -190,25 +195,20 @@ static int insert_recursive(int file_desc, int curr_block, const Record *record,
         }
     } else { /* index node */
         IndexNode *idx = (IndexNode*)BF_Block_GetData(b);
-        int key = record_get_key(schema, record);
-        int pos = 0;
-        while(pos < idx->count && key >= idx->keys[pos]) pos++;
+        int key = record_get_key(&metadata->schema, record);
+        
+        /* Use helper to find child to descend */
+        int pos = indexnode_find_child_index(idx, key);
         int child = idx->children[pos];
 
         int child_up_key, child_up_right;
-        ret_val = insert_recursive(file_desc, child, record, &child_up_key, &child_up_right, height - 1, schema);
+        ret_val = insert_recursive(file_desc, metadata, child, record, &child_up_key, &child_up_right, height - 1);
 
         if (child_up_right != -1) {
             /* child split, insert into this node */
-            if (idx->count < MAX_KEYS_INDEX) {
-                /* shift */
-                for(int i = idx->count; i > pos; i--) {
-                    idx->keys[i] = idx->keys[i-1];
-                    idx->children[i+1] = idx->children[i];
-                }
-                idx->keys[pos] = child_up_key;
-                idx->children[pos+1] = child_up_right;
-                idx->count++;
+            if (!indexnode_is_full(idx)) {
+                /* Use helper to insert key+child */
+                indexnode_insert_at(idx, pos, child_up_key, child_up_right);
                 BF_Block_SetDirty(b);
                 *up_right = -1;
             } else {
@@ -220,46 +220,13 @@ static int insert_recursive(int file_desc, int curr_block, const Record *record,
                 }
                 int new_id;
                 BF_GetBlockCounter(file_desc, &new_id); new_id--;
+                metadata->total_blocks = new_id + 1;  /* Fix: update total_blocks */
                 IndexNode *new_idx = (IndexNode*)BF_Block_GetData(new_b);
+                indexnode_init(new_idx);
 
-                /* temp arrays */
-                int temp_keys[MAX_KEYS_INDEX + 1];
-                int temp_children[MAX_KEYS_INDEX + 2];
-
-                int j=0;
-                for(int i=0; i<idx->count; i++) {
-                    if(i==pos) temp_keys[j++] = child_up_key;
-                    temp_keys[j++] = idx->keys[i];
-                }
-                if(pos == idx->count) temp_keys[j++] = child_up_key;
-
-                j=0;
-                for(int i=0; i<=idx->count; i++) {
-                     if(i==pos+1) temp_children[j++] = child_up_right;
-                     temp_children[j++] = idx->children[i];
-                }
-                if(pos+1 == idx->count+1) temp_children[j++] = child_up_right;
-
-                /* split point */
-                int total_keys = MAX_KEYS_INDEX + 1;
-                int mid = total_keys / 2;
-
-                *up_key = temp_keys[mid]; /* pivot moves up */
+                /* Use helper to split index node */
+                indexnode_split(idx, new_idx, child_up_key, child_up_right, pos, up_key);
                 *up_right = new_id;
-
-                idx->count = mid;
-                for(int i=0; i<mid; i++) {
-                    idx->keys[i] = temp_keys[i];
-                    idx->children[i] = temp_children[i];
-                }
-                idx->children[mid] = temp_children[mid];
-
-                new_idx->count = total_keys - mid - 1;
-                for(int i=0; i<new_idx->count; i++) {
-                    new_idx->keys[i] = temp_keys[mid + 1 + i];
-                    new_idx->children[i] = temp_children[mid + 1 + i];
-                }
-                new_idx->children[new_idx->count] = temp_children[total_keys];
 
                 BF_Block_SetDirty(b);
                 BF_Block_SetDirty(new_b);
@@ -277,7 +244,7 @@ static int insert_recursive(int file_desc, int curr_block, const Record *record,
 
 int bplus_record_insert(int file_desc, BPlusMeta* metadata, const Record *record) {
     int up_key, up_right;
-    int ret = insert_recursive(file_desc, metadata->root_block_id, record, &up_key, &up_right, metadata->height, &metadata->schema);
+    int ret = insert_recursive(file_desc, metadata, metadata->root_block_id, record, &up_key, &up_right, metadata->height);
 
     if (up_right != -1) {
         /* root split */
@@ -286,8 +253,10 @@ int bplus_record_insert(int file_desc, BPlusMeta* metadata, const Record *record
         if (BF_AllocateBlock(file_desc, new_root_b) != BF_OK) { BF_Block_Destroy(&new_root_b); return -1; }
         int new_root_id;
         BF_GetBlockCounter(file_desc, &new_root_id); new_root_id--;
+        metadata->total_blocks = new_root_id + 1;  /* Fix: update total_blocks */
 
         IndexNode *root = (IndexNode*)BF_Block_GetData(new_root_b);
+        indexnode_init(root);
         root->count = 1;
         root->keys[0] = up_key;
         root->children[0] = metadata->root_block_id;

@@ -15,4 +15,13 @@ typedef struct {
   int children[MAX_KEYS_INDEX + 1]; // Child block pointers
 } IndexNode;
 
+/* Helper function declarations */
+void indexnode_init(IndexNode *node);
+int indexnode_find_child_index(const IndexNode *node, int key);
+int indexnode_get_child(const IndexNode *node, int key);
+int indexnode_is_full(const IndexNode *node);
+void indexnode_insert_at(IndexNode *node, int pos, int key, int right_child);
+void indexnode_split(IndexNode *node, IndexNode *new_node, int new_key,
+                     int new_child, int insert_pos, int *promoted_key);
+
 #endif // BPLUS_INDEX_NODE_H

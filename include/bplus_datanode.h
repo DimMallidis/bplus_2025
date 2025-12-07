@@ -22,4 +22,13 @@ typedef struct {
   Record records[MAX_RECORDS_LEAF]; // Array of records
 } DataNode;
 
+/* Helper function declarations */
+void datanode_init(DataNode *node);
+int datanode_find_insert_pos(const DataNode *node, const TableSchema *schema, int key);
+void datanode_insert_at(DataNode *node, int pos, const Record *record);
+int datanode_is_full(const DataNode *node);
+int datanode_find_key(const DataNode *node, const TableSchema *schema, int key);
+int datanode_split(DataNode *node, DataNode *new_node, const Record *record,
+                   const TableSchema *schema, int insert_pos, int new_block_id);
+
 #endif // BPLUS_DATANODE_H
