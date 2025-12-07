@@ -1,14 +1,18 @@
-#ifndef BP_INDEX_NODE_H
-#define BP_INDEX_NODE_H
-#include "bf.h"
+#ifndef BPLUS_INDEX_NODE_H
+#define BPLUS_INDEX_NODE_H
 
-// MAX_KEYS_INTERNAL = 63 (Calculated: (512 - 8) / 8)
-#define MAX_KEYS_INTERNAL 63 
+// Max keys in an index node.
+// Block size 512. Overhead ~4 bytes (count).
+// Each entry has a key (int 4) and a child pointer (int 4).
+// Plus one extra child pointer.
+// (512 - 4 - 4) / 8 = 63.
+// Let's use a safe number like 60.
+#define MAX_KEYS_INDEX 60
 
 typedef struct {
-    int count;                       // Number of active keys (M)
-    int children[MAX_KEYS_INTERNAL + 1]; // Block IDs of children (M+1)
-    int keys[MAX_KEYS_INTERNAL];     // Sorted keys (M)
+  int count;                    // Number of keys
+  int keys[MAX_KEYS_INDEX];     // Keys
+  int children[MAX_KEYS_INDEX + 1]; // Child block pointers
 } IndexNode;
 
-#endif
+#endif // BPLUS_INDEX_NODE_H
